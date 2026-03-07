@@ -6,7 +6,7 @@
 The **target buyers** you must submit Core Demand predictions for.
 
 | Column | Type | Nulls | Description |
-|---|---|---|---|
+T|---|---|---|---|
 | `legal_entity_id` | int | 0 % | Unique buyer identifier. Join key to `plis_training`. |
 | `estimated_number_employees` | float | 2 % | Company headcount. Proxy for procurement volume. Heavily skewed (median 1,521 vs mean 19,064) — use log-transform as a feature. |
 | `nace_code` | int | 0 % | Primary industry classification (EUROSTAT standard). Join key to `nace_codes`. **Stored as plain integer** here. |

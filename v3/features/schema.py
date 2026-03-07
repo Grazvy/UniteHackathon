@@ -1,0 +1,15 @@
+FEATURE_COLS = [
+    "total_spend",
+    "n_orders",
+    "n_months_active",
+    "recency_months",
+    "span_months",
+    "monthly_avg",
+    "last6m_spend",
+    "buyer_total_spend",
+    "eclass_total_spend",
+    "log_employees",
+    "section_enc",
+    "nace_2digits",
+    "has_secondary_nace",
+]
