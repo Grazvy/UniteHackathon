@@ -1,8 +1,8 @@
 """
-Fundamental cold-start upgrade: two-stage approach (UPDATED: item = eclass + manufacturer)
+Fundamental cold-start upgrade: two-stage approach
 
-Stage 1 (Candidates): learn buyer–item affinity with a ranking model that uses ONLY
-buyer metadata + item popularity/meta features (no pair-history features).
+Stage 1 (Candidates): learn buyer–eclass affinity with a ranking model that uses ONLY
+buyer metadata + eclass popularity/meta features (no pair-history features).
 This works for cold buyers.
 
 Stage 2 (Value): for candidates, estimate
@@ -10,11 +10,11 @@ ExpectedSavings = P(buy) * E(spend|buy) * SAVINGS_RATE
 Core decision: ExpectedSavings > FEE
 
 Warm buyers:
-- Candidates = their historical (buyer,item) pairs (same as before, but item = eclass|manufacturer)
+- Candidates = their historical (buyer,eclass) pairs (same as before)
 - Value models = your original pair-history models (warm_clf, warm_reg)
 
 Cold buyers:
-- Candidates = top-K from ranker scores (cold_ranker) over item universe
+- Candidates = top-K from ranker scores (cold_ranker)
 - Value models = cold_clf, cold_reg trained with cold-available features + ranker score
 
 Rolling validation:
@@ -25,8 +25,7 @@ Output: ../submission.csv
 
 NOTE:
 - This code assumes customer_test.csv contains both warm and cold buyer metadata
-- plis_training.csv contains historical transactions with:
-  orderdate, legal_entity_id, eclass, manufacturer, quantityvalue, vk_per_item
+- plis_training.csv contains historical transactions with orderdate, legal_entity_id, eclass, quantityvalue, vk_per_item
 """
 
 import warnings
@@ -49,9 +48,9 @@ import seaborn as sns
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
-SAVINGS_RATE = 0.15
-FEE = 15.0
-TOTAL_FEE = FEE
+SAVINGS_RATE = 0.10
+FEE = 10.0
+TOTAL_FEE = FEE * 0.95
 
 FEATURE_CUTOFF = pd.Timestamp("2024-12-31")
 LABEL_END = pd.Timestamp("2025-06-30")
@@ -73,9 +72,12 @@ ROLLING_FOLDS = [
 
 # Candidate settings
 CANDIDATE_K_COLD = 800          # how many candidates per cold buyer from ranker
-NEG_PER_POS = 40                # negatives per positive when fitting ranker / cold models
+NEG_PER_POS = 20              # negatives per positive when fitting ranker / cold models
 
 # Small tuning grid: affects decision thresholding & candidate depth
+# EXPECTED_SPEND_SCALE_GRID = [1.0, 1.1, 1.2, 1.3]
+# CANDIDATE_K_COLD_GRID = [400, 800, 1200]
+
 EXPECTED_SPEND_SCALE_GRID = [1.0, 1.1, 1.2, 1.3]
 CANDIDATE_K_COLD_GRID = [400, 800, 1200]
 
@@ -138,18 +140,18 @@ LGBM_PARAMS_COLD_REG = dict(
     verbose=-1,
 )
 
-DATA = Path(__file__).resolve().parent.parent / "data" / "unite"
-OUT = Path(__file__).resolve().parent.parent
-PLOTS = Path(__file__).resolve().parent / "plots"
+DATA = Path(__file__).resolve().parent.parent.parent / "data" / "unite"
+OUT = Path(__file__).resolve().parent.parent.parent
+PLOTS = Path(__file__).resolve().parent.parent / "plots"
 PLOTS.mkdir(exist_ok=True)
 
 
 # -----------------------------------------------------------------------------
-# Helpers: warm pair-history features (UPDATED: group by item_key)
+# Helpers: warm pair-history features (unchanged)
 # -----------------------------------------------------------------------------
 def build_pair_features(df: pd.DataFrame, cutoff: pd.Timestamp, buyer_info: pd.DataFrame) -> pd.DataFrame:
-    """Build one row per (buyer, item_key) with pair-history aggregates."""
-    grp = df.groupby(["legal_entity_id", "item_key"])
+    """Build one row per (buyer, eclass) with pair-history aggregates."""
+    grp = df.groupby(["legal_entity_id", "eclass"])
     feats = pd.concat(
         [
             grp["line_value"].sum().rename("total_spend"),
@@ -168,22 +170,22 @@ def build_pair_features(df: pd.DataFrame, cutoff: pd.Timestamp, buyer_info: pd.D
 
     last6 = (
         df[df["orderdate"] > cutoff - pd.DateOffset(months=6)]
-        .groupby(["legal_entity_id", "item_key"])["line_value"]
+        .groupby(["legal_entity_id", "eclass"])["line_value"]
         .sum()
         .rename("last6m_spend")
         .reset_index()
     )
-    feats = feats.merge(last6, on=["legal_entity_id", "item_key"], how="left")
+    feats = feats.merge(last6, on=["legal_entity_id", "eclass"], how="left")
     feats["last6m_spend"] = feats["last6m_spend"].fillna(0)
 
     buyer_total = (
         df.groupby("legal_entity_id")["line_value"].sum().rename("buyer_total_spend").reset_index()
     )
-    item_total = (
-        df.groupby("item_key")["line_value"].sum().rename("item_total_spend").reset_index()
+    eclass_total = (
+        df.groupby("eclass")["line_value"].sum().rename("eclass_total_spend").reset_index()
     )
     feats = feats.merge(buyer_total, on="legal_entity_id", how="left")
-    feats = feats.merge(item_total, on="item_key", how="left")
+    feats = feats.merge(eclass_total, on="eclass", how="left")
 
     feats = feats.merge(
         buyer_info[
@@ -270,9 +272,9 @@ def save_feature_importance_plots(clf, reg, feature_cols: list[str], out_dir: Pa
 
 
 def realized_net(pred_df: pd.DataFrame, truth_df: pd.DataFrame) -> tuple[float, int, int, int]:
-    """Compute realized net score against known future spend (keys: buyer,item_key)."""
-    merged = pred_df[["legal_entity_id", "item_key", "is_core"]].merge(
-        truth_df, on=["legal_entity_id", "item_key"], how="left"
+    """Compute realized net score against known future spend."""
+    merged = pred_df[["legal_entity_id", "eclass", "is_core"]].merge(
+        truth_df, on=["legal_entity_id", "eclass"], how="left"
     )
     merged["future_spend"] = merged["future_spend"].fillna(0)
     earned = (merged["is_core"] * merged["future_spend"] * SAVINGS_RATE).sum()
@@ -286,110 +288,101 @@ def realized_net(pred_df: pd.DataFrame, truth_df: pd.DataFrame) -> tuple[float, 
 
 
 # -----------------------------------------------------------------------------
-# Cold-start candidate ranker and cold value models (UPDATED: item_key)
+# NEW: Cold-start candidate ranker and cold value models
 # -----------------------------------------------------------------------------
-def build_item_meta(plis_hist: pd.DataFrame) -> pd.DataFrame:
-    """Item meta features available for all buyers; unique per item_key=(eclass, manufacturer)."""
-    e = plis_hist.groupby("item_key", as_index=False).agg(
-        item_total_spend=("line_value", "sum"),
-        item_n_orders=("line_value", "size"),
-        item_n_buyers=("legal_entity_id", "nunique"),
+def build_eclass_meta(plis_hist: pd.DataFrame) -> pd.DataFrame:
+    """Eclass meta features available for all buyers (warm & cold). Must be unique per eclass."""
+    e = plis_hist.groupby("eclass", as_index=False).agg(
+        eclass_total_spend=("line_value", "sum"),
+        eclass_n_orders=("line_value", "size"),
+        eclass_n_buyers=("legal_entity_id", "nunique"),
     )
-    e["log_item_total_spend"] = np.log1p(e["item_total_spend"])
-    e["log_item_n_orders"] = np.log1p(e["item_n_orders"])
-    e["log_item_n_buyers"] = np.log1p(e["item_n_buyers"])
-    e = e.drop_duplicates(subset=["item_key"]).reset_index(drop=True)
+    e["log_eclass_total_spend"] = np.log1p(e["eclass_total_spend"])
+    e["log_eclass_n_orders"] = np.log1p(e["eclass_n_orders"])
+    e["log_eclass_n_buyers"] = np.log1p(e["eclass_n_buyers"])
+
+    # ensure strictly one row per eclass
+    e = e.drop_duplicates(subset=["eclass"]).reset_index(drop=True)
     return e
 
 
 def sample_negative_pairs(
     buyers: np.ndarray,
     positives_by_buyer: dict,
-    all_items: np.ndarray,
+    all_eclasses: np.ndarray,
     n_neg_per_pos: int,
     rng: np.random.RandomState,
-    max_group_size: int = 9000,
-    max_pos_per_buyer: int | None = 3000,
+    eclass_weights: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    """
-    Uniform negative sampling for (buyer,item_key) with per-buyer cap to satisfy
-    LightGBM ranker constraint: <= 10000 rows per query(group).
+    """Popularity-based negative sampling (frequency^0.75 smoothing, word2vec-style).
+
+    Popular eclasses are sampled more often as negatives, creating harder negatives
+    and improving model discrimination. Falls back to uniform if no weights given.
     """
     rows = []
-    all_set = set(all_items.tolist())
+    all_set = set(all_eclasses.tolist())
+
+    # Normalise weights once outside the buyer loop
+    if eclass_weights is not None:
+        sampling_probs = eclass_weights ** 0.75
+        sampling_probs = sampling_probs / sampling_probs.sum()
+    else:
+        sampling_probs = None
 
     for b in buyers:
         pos = positives_by_buyer.get(b, set())
         if not pos:
             continue
-
         pos_list = list(pos)
-
-        # Optional: cap positives used per buyer (keeps group size manageable)
-        if max_pos_per_buyer is not None and len(pos_list) > max_pos_per_buyer:
-            pos_list = rng.choice(pos_list, size=max_pos_per_buyer, replace=False).tolist()
-
         n_pos = len(pos_list)
-        if n_pos == 0:
+        n_neg = min(len(all_set) - len(pos), n_pos * n_neg_per_pos)
+        if n_neg <= 0:
             continue
 
-        # Compute allowed negatives so that total group size <= max_group_size
-        max_neg_allowed = max_group_size - n_pos
-        if max_neg_allowed <= 0:
-            # still emit positives (or you can skip this buyer)
-            for it in pos_list:
-                rows.append((b, it, 1))
-            continue
-
-        target_neg = min(n_pos * n_neg_per_pos, len(all_set) - len(pos), max_neg_allowed)
-        if target_neg <= 0:
-            for it in pos_list:
-                rows.append((b, it, 1))
-            continue
-
-        # Oversample then filter out positives
-        cand = rng.choice(all_items, size=target_neg * 3, replace=True).tolist()
+        # oversample then filter out true positives
+        cand = rng.choice(all_eclasses, size=n_neg * 3, replace=True, p=sampling_probs).tolist()
         negs = []
-        for it in cand:
-            if it not in pos:
-                negs.append(it)
-                if len(negs) >= target_neg:
+        for c in cand:
+            if c not in pos:
+                negs.append(c)
+                if len(negs) >= n_neg:
                     break
 
-        # If still short (rare), keep as-is
-        for it in pos_list:
-            rows.append((b, it, 1))
-        for it in negs:
-            rows.append((b, it, 0))
+        for ec in pos_list:
+            rows.append((b, ec, 1))
+        for ec in negs:
+            rows.append((b, ec, 0))
 
-    return pd.DataFrame(rows, columns=["legal_entity_id", "item_key", "label"])
-
+    return pd.DataFrame(rows, columns=["legal_entity_id", "eclass", "label"])
 
 
 def make_cold_rank_features(
     pairs: pd.DataFrame,
     buyer_info: pd.DataFrame,
-    item_meta: pd.DataFrame,
+    eclass_meta: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Features for ranker/cold models: buyer meta + item meta (+ categorical item_key)."""
+    """Features for ranker/cold models: buyer meta + eclass meta (+ categorical eclass)."""
     df = pairs.merge(
         buyer_info[["legal_entity_id", "log_employees", "section_enc", "nace_2digits", "has_secondary_nace"]],
         on="legal_entity_id",
         how="left",
     ).merge(
-        item_meta[["item_key", "log_item_total_spend", "log_item_n_orders", "log_item_n_buyers"]],
-        on="item_key",
+        eclass_meta[["eclass", "log_eclass_total_spend", "log_eclass_n_orders", "log_eclass_n_buyers"]],
+        on="eclass",
         how="left",
     )
+    # Fill
     for c in ["log_employees", "section_enc", "nace_2digits", "has_secondary_nace"]:
         df[c] = df[c].fillna(-1)
-    for c in ["log_item_total_spend", "log_item_n_orders", "log_item_n_buyers"]:
+    for c in ["log_eclass_total_spend", "log_eclass_n_orders", "log_eclass_n_buyers"]:
         df[c] = df[c].fillna(0)
 
-    df["item_key_cat"] = df["item_key"].astype("category")
+    # Keep eclass as categorical for LightGBM (helps cold start a lot)
+    df["eclass_cat"] = df["eclass"].astype("category")
 
-    if df.duplicated(subset=["legal_entity_id", "item_key"]).any():
-        df = df.drop_duplicates(subset=["legal_entity_id", "item_key"]).reset_index(drop=True)
+    if df.duplicated(subset=["legal_entity_id", "eclass"]).any():
+        # This should not happen; indicates duplicate eclass_meta or duplicate input pairs.
+        df = df.drop_duplicates(subset=["legal_entity_id", "eclass"]).reset_index(drop=True)
 
     return df
 
@@ -399,11 +392,11 @@ COLD_FEATS_NUM = [
     "section_enc",
     "nace_2digits",
     "has_secondary_nace",
-    "log_item_total_spend",
-    "log_item_n_orders",
-    "log_item_n_buyers",
+    "log_eclass_total_spend",
+    "log_eclass_n_orders",
+    "log_eclass_n_buyers",
 ]
-COLD_FEATS_CAT = ["item_key_cat"]
+COLD_FEATS_CAT = ["eclass_cat"]
 
 
 def train_ranker(
@@ -414,40 +407,42 @@ def train_ranker(
     rng: np.random.RandomState,
     neg_per_pos: int = NEG_PER_POS,
 ):
-    """Train LGBMRanker for candidate generation over item_key."""
+    """Train LGBMRanker for candidate generation."""
     hist = plis_hist[(plis_hist["orderdate"] <= train_end) & (plis_hist["legal_entity_id"].isin(warm_train_ids))].copy()
     if hist.empty:
         return None, None
 
-    item_meta = build_item_meta(hist)
+    eclass_meta = build_eclass_meta(hist)
 
-    pos_pairs = hist.groupby(["legal_entity_id", "item_key"]).size().reset_index(name="cnt")
+    pos_pairs = hist.groupby(["legal_entity_id", "eclass"]).size().reset_index(name="cnt")
     positives_by_buyer = {
-        b: set(g["item_key"].tolist())
+        b: set(g["eclass"].tolist())
         for b, g in pos_pairs.groupby("legal_entity_id")
     }
 
-    all_items = np.array(sorted(hist["item_key"].unique().tolist()))
+    all_eclasses = np.array(sorted(hist["eclass"].unique().tolist()))
     buyers = np.array(sorted(list(positives_by_buyer.keys())))
 
-    MAX_GROUP_SIZE_RANKER = 9000  # must be < 10000 (LightGBM limit). Keep buffer.
-    MAX_POS_PER_BUYER_RANKER = 3000  # optional; prevents huge buyers from dominating
+    # Popularity weights: order count per eclass (aligned to all_eclasses order)
+    eclass_order_counts = hist.groupby("eclass").size()
+    eclass_weights = np.array(
+        [eclass_order_counts.get(ec, 1) for ec in all_eclasses], dtype=float
+    )
 
     sampled = sample_negative_pairs(
         buyers=buyers,
         positives_by_buyer=positives_by_buyer,
-        all_items=all_items,
+        all_eclasses=all_eclasses,
         n_neg_per_pos=neg_per_pos,
         rng=rng,
-        max_group_size=MAX_GROUP_SIZE_RANKER,
-        max_pos_per_buyer=MAX_POS_PER_BUYER_RANKER,
+        eclass_weights=eclass_weights,
     )
-
-    feats = make_cold_rank_features(sampled, buyer_info, item_meta)
+    feats = make_cold_rank_features(sampled, buyer_info, eclass_meta)
 
     X = feats[COLD_FEATS_NUM + COLD_FEATS_CAT]
     y = feats["label"].astype(int)
 
+    # Group by buyer for ranking
     group_sizes = feats.groupby("legal_entity_id").size().loc[buyers].tolist()
 
     ranker = lgb.LGBMRanker(**LGBM_PARAMS_RANKER)
@@ -456,29 +451,30 @@ def train_ranker(
         group=group_sizes,
         categorical_feature=COLD_FEATS_CAT,
     )
-    return ranker, item_meta
+    return ranker, eclass_meta
 
 
 def score_candidates_for_buyers(
     buyer_ids: list,
-    all_items: np.ndarray,
+    all_eclasses: np.ndarray,
     buyer_info: pd.DataFrame,
-    item_meta: pd.DataFrame,
+    eclass_meta: pd.DataFrame,
     ranker,
     top_k: int,
 ) -> pd.DataFrame:
-    """Score (buyer,item_key) pairs for a buyer set and keep top_k per buyer."""
+    """Score (buyer,eclass) pairs for a buyer set and keep top_k per buyer."""
     rows = []
+    # Chunk over buyers for memory safety
     for b in buyer_ids:
-        tmp = pd.DataFrame({"legal_entity_id": b, "item_key": all_items})
+        tmp = pd.DataFrame({"legal_entity_id": b, "eclass": all_eclasses})
         tmp["label"] = 0
-        tmp_feats = make_cold_rank_features(tmp, buyer_info, item_meta)
+        tmp_feats = make_cold_rank_features(tmp, buyer_info, eclass_meta)
         X = tmp_feats[COLD_FEATS_NUM + COLD_FEATS_CAT]
         tmp_feats["rank_score"] = ranker.predict(X)
         tmp_feats = tmp_feats.sort_values("rank_score", ascending=False).head(top_k)
-        rows.append(tmp_feats[["legal_entity_id", "item_key", "rank_score"]])
+        rows.append(tmp_feats[["legal_entity_id", "eclass", "rank_score"]])
     if not rows:
-        return pd.DataFrame(columns=["legal_entity_id", "item_key", "rank_score"])
+        return pd.DataFrame(columns=["legal_entity_id", "eclass", "rank_score"])
     return pd.concat(rows, ignore_index=True)
 
 
@@ -488,12 +484,12 @@ def build_future_spend_labels(
     end: pd.Timestamp,
     ids: set,
 ) -> pd.DataFrame:
-    """Future spend by (buyer,item_key) in label window."""
+    """Future spend by (buyer,eclass) in label window."""
     lab = plis[
         (plis["orderdate"] >= start) & (plis["orderdate"] <= end) & (plis["legal_entity_id"].isin(ids))
     ].copy()
     out = (
-        lab.groupby(["legal_entity_id", "item_key"])["line_value"]
+        lab.groupby(["legal_entity_id", "eclass"])["line_value"]
         .sum()
         .rename("future_spend")
         .reset_index()
@@ -507,13 +503,13 @@ def train_cold_value_models(
     warm_train_ids: set,
     fold: dict,
     ranker,
-    item_meta: pd.DataFrame,
+    eclass_meta: pd.DataFrame,
     rng: np.random.RandomState,
     neg_per_pos: int = NEG_PER_POS,
 ):
     """
-    Train cold P(buy) and spend|buy using cold-available features + rank_score.
-    Labels come from fold val window, but features only from metadata + item_meta + rank_score.
+    Train cold P(buy) and spend|buy using *cold-available* features + rank_score.
+    Labels come from fold val window, but features only from metadata + eclass_meta + rank_score.
     """
     train_end, val_start, val_end = fold["train_end"], fold["val_start"], fold["val_end"]
 
@@ -521,11 +517,19 @@ def train_cold_value_models(
     if hist.empty:
         return None, None
 
-    all_items = np.array(sorted(hist["item_key"].unique().tolist()))
+    # Universe of eclasses seen in history
+    all_eclasses = np.array(sorted(hist["eclass"].unique().tolist()))
 
+    # Popularity weights: order count per eclass (aligned to all_eclasses order)
+    eclass_order_counts = hist.groupby("eclass").size()
+    eclass_weights = np.array(
+        [eclass_order_counts.get(ec, 1) for ec in all_eclasses], dtype=float
+    )
+
+    # Positives defined on FUTURE window (purchase happens in val window)
     truth = build_future_spend_labels(plis_hist, val_start, val_end, warm_train_ids)
     positives_by_buyer = {
-        b: set(g.loc[g["future_spend"] > 0, "item_key"].tolist())
+        b: set(g.loc[g["future_spend"] > 0, "eclass"].tolist())
         for b, g in truth.groupby("legal_entity_id")
     }
     buyers = np.array(sorted(list(positives_by_buyer.keys())))
@@ -535,21 +539,25 @@ def train_cold_value_models(
     sampled = sample_negative_pairs(
         buyers=buyers,
         positives_by_buyer=positives_by_buyer,
-        all_items=all_items,
+        all_eclasses=all_eclasses,
         n_neg_per_pos=neg_per_pos,
         rng=rng,
+        eclass_weights=eclass_weights,
     )
 
-    sampled = sampled.merge(truth, on=["legal_entity_id", "item_key"], how="left")
+    # Attach spend label from truth
+    sampled = sampled.merge(truth, on=["legal_entity_id", "eclass"], how="left")
     sampled["future_spend"] = sampled["future_spend"].fillna(0.0)
 
-    feats = make_cold_rank_features(sampled, buyer_info, item_meta)
+    feats = make_cold_rank_features(sampled, buyer_info, eclass_meta)
+    # rank_score feature
     X_rank = feats[COLD_FEATS_NUM + COLD_FEATS_CAT]
     feats["rank_score"] = ranker.predict(X_rank)
     feats["log_spend_label"] = np.log1p(feats["future_spend"])
 
     COLD_VALUE_FEATS = COLD_FEATS_NUM + ["rank_score"] + COLD_FEATS_CAT
 
+    # Classifier: label if future_spend>0 (or label column)
     clf = lgb.LGBMClassifier(**LGBM_PARAMS_COLD_CLF)
     clf.fit(
         feats[COLD_VALUE_FEATS],
@@ -557,6 +565,7 @@ def train_cold_value_models(
         categorical_feature=COLD_FEATS_CAT,
     )
 
+    # Regressor on positives only
     pos_mask = feats["future_spend"] > 0
     reg = lgb.LGBMRegressor(**LGBM_PARAMS_COLD_REG)
     if pos_mask.sum() > 20:
@@ -566,6 +575,7 @@ def train_cold_value_models(
             categorical_feature=COLD_FEATS_CAT,
         )
     else:
+        # fallback: constant regressor via dummy fit
         reg.fit(
             feats[COLD_VALUE_FEATS].head(50),
             np.zeros(min(50, len(feats))),
@@ -575,28 +585,31 @@ def train_cold_value_models(
 
 
 def infer_expected_spend_cold(
-    candidate_pairs: pd.DataFrame,   # legal_entity_id,item_key,rank_score(optional)
+    candidate_pairs: pd.DataFrame,   # legal_entity_id,eclass,rank_score(optional)
     buyer_info: pd.DataFrame,
-    item_meta: pd.DataFrame,
+    eclass_meta: pd.DataFrame,
     ranker,
     cold_clf,
     cold_reg,
     expected_spend_scale: float,
 ) -> pd.DataFrame:
-    """Cold inference using buyer meta + item meta + rank_score."""
+    """Cold inference using metadata + eclass meta + rank_score (aligned by keys)."""
 
     base = candidate_pairs.copy()
     if "rank_score" not in base.columns:
         base["rank_score"] = np.nan
 
-    feats = make_cold_rank_features(base.assign(label=0), buyer_info, item_meta)
+    # Build features on the same keys
+    feats = make_cold_rank_features(base.assign(label=0), buyer_info, eclass_meta)
 
+    # Attach rank_score by key (prevents length mismatch)
     feats = feats.merge(
-        base[["legal_entity_id", "item_key", "rank_score"]],
-        on=["legal_entity_id", "item_key"],
+        base[["legal_entity_id", "eclass", "rank_score"]],
+        on=["legal_entity_id", "eclass"],
         how="left",
         suffixes=("", "_base"),
     )
+    # If rank_score missing, compute from ranker
     needs_score = feats["rank_score"].isna()
     if needs_score.any():
         Xr = feats.loc[needs_score, COLD_FEATS_NUM + COLD_FEATS_CAT]
@@ -608,13 +621,14 @@ def infer_expected_spend_cold(
     p_buy = cold_clf.predict_proba(X)[:, 1]
     spend_if_buy = np.expm1(cold_reg.predict(X)).clip(min=0)
 
-    out = feats[["legal_entity_id", "item_key", "rank_score"]].copy()
+    out = feats[["legal_entity_id", "eclass", "rank_score"]].copy()
     out["p_buy"] = p_buy
     out["spend_if_buy"] = spend_if_buy
     out["expected_spend"] = p_buy * spend_if_buy * expected_spend_scale
     out["expected_savings"] = out["expected_spend"] * SAVINGS_RATE
     out["is_core"] = (out["expected_savings"] > TOTAL_FEE).astype(int)
     return out
+
 
 
 # -----------------------------------------------------------------------------
@@ -629,7 +643,7 @@ WARM_FEATURE_COLS = [
     "monthly_avg",
     "last6m_spend",
     "buyer_total_spend",
-    "item_total_spend",
+    "eclass_total_spend",
     "log_employees",
     "section_enc",
     "nace_2digits",
@@ -650,6 +664,7 @@ def evaluate_fold(
 ) -> dict:
     train_end, val_start, val_end = fold["train_end"], fold["val_start"], fold["val_end"]
 
+    # --- Warm training data for warm models (pair-history)
     feat_df = plis[(plis["orderdate"] <= train_end) & (plis["legal_entity_id"].isin(warm_train_ids))].copy()
     label_df = plis[
         (plis["orderdate"] >= val_start) & (plis["orderdate"] <= val_end) &
@@ -659,12 +674,12 @@ def evaluate_fold(
     train_feats = build_pair_features(feat_df, train_end, buyer_info)
     future_spend_train = (
         label_df[label_df["legal_entity_id"].isin(warm_train_ids)]
-        .groupby(["legal_entity_id", "item_key"])["line_value"]
+        .groupby(["legal_entity_id", "eclass"])["line_value"]
         .sum()
         .rename("future_spend")
         .reset_index()
     )
-    train_feats = train_feats.merge(future_spend_train, on=["legal_entity_id", "item_key"], how="left")
+    train_feats = train_feats.merge(future_spend_train, on=["legal_entity_id", "eclass"], how="left")
     train_feats["future_spend"] = train_feats["future_spend"].fillna(0)
     train_feats["buy_label"] = (train_feats["future_spend"] > 0).astype(int)
     train_feats["log_spend_label"] = np.log1p(train_feats["future_spend"])
@@ -674,7 +689,8 @@ def evaluate_fold(
 
     warm_clf, warm_reg = train_two_models_warmpair(train_feats, WARM_FEATURE_COLS)
 
-    ranker, item_meta = train_ranker(plis, buyer_info, warm_train_ids, train_end, rng=rng, neg_per_pos=NEG_PER_POS)
+    # --- Train ranker & cold value models from warm_train only
+    ranker, eclass_meta = train_ranker(plis, buyer_info, warm_train_ids, train_end, rng=rng, neg_per_pos=NEG_PER_POS)
     if ranker is None:
         return {"fold": fold["name"], "warm_net": -np.inf, "cold_proxy_net": -np.inf, "combined_net": -np.inf}
 
@@ -684,54 +700,51 @@ def evaluate_fold(
         warm_train_ids=warm_train_ids,
         fold=fold,
         ranker=ranker,
-        item_meta=item_meta,
+        eclass_meta=eclass_meta,
         rng=rng,
         neg_per_pos=NEG_PER_POS,
     )
     if cold_clf is None:
         return {"fold": fold["name"], "warm_net": -np.inf, "cold_proxy_net": -np.inf, "combined_net": -np.inf}
 
+    # --- Warm evaluation (pair-history pipeline)
     warm_eval_feat_df = plis[(plis["orderdate"] <= train_end) & (plis["legal_entity_id"].isin(warm_eval_ids))].copy()
     warm_eval_feats = build_pair_features(warm_eval_feat_df, train_end, buyer_info)
-    warm_eval_pred = infer_expected_spend_warmpair(
-        warm_eval_feats, warm_clf, warm_reg, WARM_FEATURE_COLS, expected_spend_scale
-    )
+    warm_eval_pred = infer_expected_spend_warmpair(warm_eval_feats, warm_clf, warm_reg, WARM_FEATURE_COLS, expected_spend_scale)
 
     warm_truth = (
         label_df[label_df["legal_entity_id"].isin(warm_eval_ids)]
-        .groupby(["legal_entity_id", "item_key"])["line_value"]
+        .groupby(["legal_entity_id", "eclass"])["line_value"]
         .sum()
         .rename("future_spend")
         .reset_index()
     )
     warm_net, warm_n, warm_tp, warm_fp = realized_net(warm_eval_pred, warm_truth)
 
+    # --- Cold proxy evaluation: run the true cold pipeline on pseudo_cold_ids
     hist = plis[(plis["orderdate"] <= train_end) & (plis["legal_entity_id"].isin(warm_train_ids))].copy()
-    all_items = np.array(sorted(hist["item_key"].unique().tolist()))
+    all_eclasses = np.array(sorted(hist["eclass"].unique().tolist()))
     pseudo_cold_list = sorted(list(pseudo_cold_ids))
-
     cand = score_candidates_for_buyers(
         buyer_ids=pseudo_cold_list,
-        all_items=all_items,
+        all_eclasses=all_eclasses,
         buyer_info=buyer_info,
-        item_meta=item_meta,
+        eclass_meta=eclass_meta,
         ranker=ranker,
         top_k=candidate_k_cold,
     )
-
     cold_pred = infer_expected_spend_cold(
         candidate_pairs=cand,
         buyer_info=buyer_info,
-        item_meta=item_meta,
+        eclass_meta=eclass_meta,
         ranker=ranker,
         cold_clf=cold_clf,
         cold_reg=cold_reg,
         expected_spend_scale=expected_spend_scale,
     )
-
     cold_truth = (
         label_df[label_df["legal_entity_id"].isin(pseudo_cold_ids)]
-        .groupby(["legal_entity_id", "item_key"])["line_value"]
+        .groupby(["legal_entity_id", "eclass"])["line_value"]
         .sum()
         .rename("future_spend")
         .reset_index()
@@ -783,25 +796,16 @@ for chunk in pd.read_csv(
     DATA / "plis_training.csv",
     sep="\t",
     low_memory=False,
-    usecols=["orderdate", "legal_entity_id", "eclass", "manufacturer", "quantityvalue", "vk_per_item"],
+    usecols=["orderdate", "legal_entity_id", "eclass", "quantityvalue", "vk_per_item"],
     chunksize=300_000,
 ):
     chunk["orderdate"] = pd.to_datetime(chunk["orderdate"])
     chunks.append(chunk)
 
 plis = pd.concat(chunks, ignore_index=True)
-
-# eclass cleaning
 plis["eclass"] = pd.to_numeric(plis["eclass"], errors="coerce")
 plis = plis.dropna(subset=["eclass"])
 plis["eclass"] = plis["eclass"].astype(int).astype(str)
-
-# manufacturer cleaning
-plis["manufacturer"] = plis["manufacturer"].astype(str).fillna("UNKNOWN")
-
-# build item_key
-plis["item_key"] = plis["eclass"] + "|" + plis["manufacturer"]
-
 plis["line_value"] = plis["quantityvalue"] * plis["vk_per_item"]
 plis["ym"] = plis["orderdate"].dt.to_period("M")
 plis = plis[plis["legal_entity_id"].isin(set(customers["legal_entity_id"]))].copy()
@@ -810,7 +814,7 @@ print(f"Rows: {len(plis):,} | Warm buyers: {len(warm_ids)} | Cold buyers: {len(c
 
 
 # -----------------------------------------------------------------------------
-# 2) Rolling validation + net tuning
+# 2) Rolling validation + net tuning (now truly cold-capable)
 # -----------------------------------------------------------------------------
 print("\nRunning rolling validation + net-score tuning...")
 
@@ -879,6 +883,7 @@ print(f" Avg combined net = EUR {best['avg_combined_net']:,.2f}")
 # -----------------------------------------------------------------------------
 print("\nTraining final models on canonical split...")
 
+# Warm models on pair-history
 feat_df = plis[(plis["orderdate"] <= FEATURE_CUTOFF) & (plis["legal_entity_id"].isin(warm_ids))].copy()
 label_df = plis[
     (plis["orderdate"] > FEATURE_CUTOFF) & (plis["orderdate"] <= LABEL_END) & (plis["legal_entity_id"].isin(warm_ids))
@@ -886,12 +891,12 @@ label_df = plis[
 
 train_feats = build_pair_features(feat_df, FEATURE_CUTOFF, buyer_info)
 future_spend = (
-    label_df.groupby(["legal_entity_id", "item_key"])["line_value"]
+    label_df.groupby(["legal_entity_id", "eclass"])["line_value"]
     .sum()
     .rename("future_spend")
     .reset_index()
 )
-train_feats = train_feats.merge(future_spend, on=["legal_entity_id", "item_key"], how="left")
+train_feats = train_feats.merge(future_spend, on=["legal_entity_id", "eclass"], how="left")
 train_feats["future_spend"] = train_feats["future_spend"].fillna(0)
 train_feats["buy_label"] = (train_feats["future_spend"] > 0).astype(int)
 train_feats["log_spend_label"] = np.log1p(train_feats["future_spend"])
@@ -900,7 +905,7 @@ warm_clf, warm_reg = train_two_models_warmpair(train_feats, WARM_FEATURE_COLS)
 save_feature_importance_plots(warm_clf, warm_reg, WARM_FEATURE_COLS, PLOTS)
 
 warm_holdout_pred = infer_expected_spend_warmpair(
-    train_feats[["legal_entity_id", "item_key"] + WARM_FEATURE_COLS],
+    train_feats[["legal_entity_id", "eclass"] + WARM_FEATURE_COLS],
     warm_clf,
     warm_reg,
     WARM_FEATURE_COLS,
@@ -910,8 +915,9 @@ warm_net, warm_n, warm_tp, warm_fp = realized_net(warm_holdout_pred, future_spen
 print("\nCanonical warm holdout metrics (approx, optimistic):")
 print(f" warm_net = EUR {warm_net:,.2f} | preds={warm_n} | tp={warm_tp} | fp={warm_fp}")
 
+# Ranker + cold value models trained on warm buyers (cold-available features)
 final_rng = np.random.RandomState(42)
-ranker, item_meta = train_ranker(plis, buyer_info, warm_ids, FEATURE_CUTOFF, rng=final_rng, neg_per_pos=NEG_PER_POS)
+ranker, eclass_meta = train_ranker(plis, buyer_info, warm_ids, FEATURE_CUTOFF, rng=final_rng, neg_per_pos=NEG_PER_POS)
 
 final_fold_like = {
     "train_end": FEATURE_CUTOFF,
@@ -924,7 +930,7 @@ cold_clf, cold_reg = train_cold_value_models(
     warm_train_ids=warm_ids,
     fold=final_fold_like,
     ranker=ranker,
-    item_meta=item_meta,
+    eclass_meta=eclass_meta,
     rng=np.random.RandomState(7),
     neg_per_pos=NEG_PER_POS,
 )
@@ -940,17 +946,17 @@ warm_pred_feats = build_pair_features(warm_full, pred_cutoff, buyer_info)
 warm_pred = infer_expected_spend_warmpair(warm_pred_feats, warm_clf, warm_reg, WARM_FEATURE_COLS, EXPECTED_SPEND_SCALE)
 
 warm_sub = (
-    warm_pred.loc[warm_pred["is_core"] == 1, ["legal_entity_id", "item_key"]]
-    .rename(columns={"legal_entity_id": "buyer_id", "item_key": "cluster"})
+    warm_pred.loc[warm_pred["is_core"] == 1, ["legal_entity_id", "eclass"]]
+    .rename(columns={"legal_entity_id": "buyer_id", "eclass": "cluster"})
 )
 print(f"Warm core predictions: {len(warm_sub):,}")
 
 
 # -----------------------------------------------------------------------------
-# 5) Final predictions: cold
+# 5) Final predictions: cold (NEW PIPELINE)
 # -----------------------------------------------------------------------------
 hist_for_universe = plis[(plis["orderdate"] <= pred_cutoff) & (plis["legal_entity_id"].isin(warm_ids))].copy()
-all_items = np.array(sorted(hist_for_universe["item_key"].unique().tolist()))
+all_eclasses = np.array(sorted(hist_for_universe["eclass"].unique().tolist()))
 
 cold_list = sorted(list(cold_ids))
 if len(cold_list) == 0:
@@ -959,16 +965,16 @@ if len(cold_list) == 0:
 else:
     cold_cand = score_candidates_for_buyers(
         buyer_ids=cold_list,
-        all_items=all_items,
+        all_eclasses=all_eclasses,
         buyer_info=buyer_info,
-        item_meta=item_meta,
+        eclass_meta=eclass_meta,
         ranker=ranker,
         top_k=CANDIDATE_K_COLD,
     )
     cold_pred = infer_expected_spend_cold(
         candidate_pairs=cold_cand,
         buyer_info=buyer_info,
-        item_meta=item_meta,
+        eclass_meta=eclass_meta,
         ranker=ranker,
         cold_clf=cold_clf,
         cold_reg=cold_reg,
@@ -976,8 +982,8 @@ else:
     )
 
     cold_sub = (
-        cold_pred.loc[cold_pred["is_core"] == 1, ["legal_entity_id", "item_key"]]
-        .rename(columns={"legal_entity_id": "buyer_id", "item_key": "cluster"})
+        cold_pred.loc[cold_pred["is_core"] == 1, ["legal_entity_id", "eclass"]]
+        .rename(columns={"legal_entity_id": "buyer_id", "eclass": "cluster"})
     )
     covered = cold_sub["buyer_id"].nunique() if not cold_sub.empty else 0
     print(f"Cold core predictions: {len(cold_sub):,} across {covered}/{len(cold_ids)} buyers")
